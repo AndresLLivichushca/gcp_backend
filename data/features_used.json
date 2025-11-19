@@ -1,0 +1,11 @@
+{
+  "feature_cols": [
+    "stock",
+    "avg_usage",
+    "reorder_point",
+    "reorder_quantity",
+    "sale_amount_lag1",
+    "sale_amount_ma7",
+    "stock_to_reorder"
+  ]
+}

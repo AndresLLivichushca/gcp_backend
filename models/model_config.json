@@ -1,0 +1,8 @@
+{
+  "rnn_type": "LSTM",
+  "units": 64,
+  "num_rnn_layers": 1,
+  "dropout": 0.2,
+  "dense_units": 64,
+  "learning_rate": 0.001
+}
