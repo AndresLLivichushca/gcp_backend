@@ -1,16 +1,21 @@
 from fastapi import FastAPI, HTTPException, Query, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List
 import pandas as pd
 import numpy as np
 import json
 from pathlib import Path
+from io import StringIO
+import os
 
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 
-# Activar ejecución eager global y en el modelo
+from openai import OpenAI
+
+# Activar ejecución eager global
 tf.config.run_functions_eagerly(True)
 
 # =========================================
@@ -43,6 +48,8 @@ model.compile(
 )
 print("[INIT] Todo cargado correctamente.")
 
+# Cliente de OpenAI 
+openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # ============================================================
 # FUNCIONES AUXILIARES
@@ -242,7 +249,7 @@ app = FastAPI(
 # ========= CORS =========
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Permite todos los orígenes
+    allow_origins=["*"],  # Permite todos los orígenes (para pruebas)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -306,6 +313,109 @@ def get_recommendations_all(
     )
 
 
+
+
+
+# ============================================================
+# ============================================================
+# ENDPOINT DE RESUMEN CSV CON OPENAI
+# ============================================================
+
+@app.get("/reporte-resumen-csv")
+def reporte_resumen_csv(
+    fecha: str = Query(..., description="Fecha YYYY-MM-DD"),
+    lead_time_days: int = Query(5, ge=1),
+    service_z: float = Query(1.28),
+    max_items: int = Query(50, ge=1, le=200),
+):
+    """
+    Genera un resumen en lenguaje natural sobre las recomendaciones globales
+    y lo devuelve como un CSV descargable con una sola columna: summary.
+    """
+
+    # Verificar que la API key esté configurada
+    if os.environ.get("OPENAI_API_KEY") is None:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY no está configurada en el servidor.",
+        )
+
+    # 1) Obtener recomendaciones globales
+    df_orders = recommend_orders_all(
+        ref_date=fecha,
+        lead_time_days=lead_time_days,
+        service_z=service_z,
+        panel_df=panel,
+        model=model,
+        feature_cols=feature_cols,
+        lookback=LOOKBACK,
+    )
+
+    if df_orders.empty:
+        texto = (
+            f"Para la fecha {fecha} no se encontraron productos con recomendación "
+            "de compra. El inventario parece suficiente según el modelo."
+        )
+    else:
+        # Reducimos a los primeros N productos para que el prompt no sea gigante
+        df_top = df_orders.head(max_items).copy()
+
+        cols = [
+            "product_id",
+            "product_name",
+            "current_stock",
+            "target_stock",
+            "recommended_order",
+            "predicted_demand_1day",
+        ]
+        cols = [c for c in cols if c in df_top.columns]
+        df_prompt = df_top[cols]
+
+        tabla_csv = df_prompt.to_csv(index=False)
+
+        prompt = f"""
+Eres un analista de inventario de un minimercado.
+
+Tienes una tabla CSV con recomendaciones de compra de productos.
+Cada fila indica el producto, su stock actual, el stock objetivo y la cantidad recomendada de compra.
+
+Tu tarea es escribir un RESUMEN EN ESPAÑOL, entendible para una persona sin conocimientos técnicos.
+No menciones palabras técnicas como "stock de seguridad", "lead time" ni fórmulas.
+Habla en términos simples, por ejemplo:
+- "Este producto se vende bastante y el stock actual es bajo, por eso se recomienda comprar X unidades".
+- "Este producto tiene buen stock, pero es importante mantener un nivel mínimo de Y unidades", etc.
+
+No repitas la tabla ni uses listas muy largas, solo un texto corrido y claro.
+
+Tabla de datos (formato CSV):
+
+{tabla_csv}
+"""
+
+        resp = openai_client.responses.create(
+            model="gpt-4.1-mini",
+            input=prompt,
+        )
+
+        # Tomamos el texto generado
+        texto = resp.output[0].content[0].text.value
+
+    # 2) Construimos un CSV en memoria con una sola columna 'summary'
+    buffer = StringIO()
+    buffer.write("summary\n")
+    safe_text = texto.replace('"', '""')
+    buffer.write(f'"{safe_text}"\n')
+    buffer.seek(0)
+
+    filename = f"reporte_resumen_{fecha}.csv"
+
+    return StreamingResponse(
+        buffer,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 # ============================================================
 # ENDPOINT DE REENTRENAMIENTO CON CSV
 # ============================================================
@@ -363,10 +473,8 @@ async def upload_csv(file: UploadFile = File(...)):
                 errors="coerce"
             )
 
-        # Asegurarnos de que tampoco tenga NaT raros
+        # Limpiar fechas inválidas
         if df_existing["date"].isna().any():
-            # Si quieres, aquí podrías limpiar o lanzar error;
-            # por ahora simplemente rellenamos con 0 para evitar crasheos
             df_existing = df_existing.dropna(subset=["date"])
 
         # ========= UNIFICAR COLUMNAS Y COMBINAR =========
@@ -430,3 +538,4 @@ async def upload_csv(file: UploadFile = File(...)):
             status_code=500,
             detail=f"Error al cargar o reentrenar el modelo: {e}",
         )
+
