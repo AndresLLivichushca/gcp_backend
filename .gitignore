@@ -1,9 +1,8 @@
-__pycache__/
-.ipynb_checkpoints/
-*.ipynb
-*.log
-mlruns/
 *.csv
 !data/panel_diario_por_producto.csv
-models/*.h5
+
+# Ignorar todo en models, menos el modelo final
+models/*
+!models/lstm_model.h5
+
 .env
