@@ -236,6 +236,23 @@ class RecommendationsResponse(BaseModel):
     items: List[Recommendation]
 
 
+class SummaryProduct(BaseModel):
+    product_id: str
+    product_name: str
+    current_stock: float
+    target_stock: float
+    recommended_order: float
+    predicted_demand_1day: float
+
+
+class SummaryReport(BaseModel):
+    ref_date: str
+    lead_time_days: int
+    service_z: float
+    products: List[SummaryProduct]
+    summary: str
+
+
 # ============================================================
 # APP FASTAPI
 # ============================================================
@@ -313,24 +330,21 @@ def get_recommendations_all(
     )
 
 
-
-
-
 # ============================================================
-# ============================================================
-# ENDPOINT DE RESUMEN CSV CON OPENAI
+# ENDPOINT DE RESUMEN INTELIGENTE (JSON)
 # ============================================================
 
-@app.get("/reporte-resumen-csv")
-def reporte_resumen_csv(
+@app.get("/reporte-resumen-json", response_model=SummaryReport)
+def reporte_resumen_json(
     fecha: str = Query(..., description="Fecha YYYY-MM-DD"),
     lead_time_days: int = Query(5, ge=1),
     service_z: float = Query(1.28),
     max_items: int = Query(50, ge=1, le=200),
 ):
     """
-    Genera un resumen en lenguaje natural sobre las recomendaciones globales
-    y lo devuelve como un CSV descargable con una sola columna: summary.
+    Devuelve:
+    - lista de productos urgentes (recommended_order > 0)
+    - un resumen en lenguaje natural generado por el agente
     """
 
     # Verificar que la API key esté configurada
@@ -351,13 +365,128 @@ def reporte_resumen_csv(
         lookback=LOOKBACK,
     )
 
+    # Filtramos solo los productos que realmente necesitan pedido
+    df_urgent = df_orders[df_orders["recommended_order"] > 0].copy()
+
+    if df_urgent.empty:
+        summary_text = (
+            f"Para la fecha {fecha} no se encontraron productos que requieran "
+            "un pedido urgente. El stock actual parece suficiente en general."
+        )
+        products_list: List[SummaryProduct] = []
+    else:
+        # Limitamos a max_items para no hacer el prompt gigante
+        df_top = df_urgent.head(max_items)
+
+        cols = [
+            "product_id",
+            "product_name",
+            "current_stock",
+            "target_stock",
+            "recommended_order",
+            "predicted_demand_1day",
+        ]
+        cols = [c for c in cols if c in df_top.columns]
+        df_prompt = df_top[cols]
+
+        tabla_csv = df_prompt.to_csv(index=False)
+
+        prompt = f"""
+Eres un analista de inventario de un minimercado.
+
+Tienes una tabla CSV con recomendaciones de compra de productos.
+Cada fila indica el producto, su stock actual, el stock objetivo y la cantidad recomendada de compra.
+
+Tu tarea es escribir un RESUMEN EN ESPAÑOL, entendible para una persona sin conocimientos técnicos.
+No menciones palabras técnicas como "stock de seguridad", "lead time" ni fórmulas.
+Habla en términos simples, por ejemplo:
+- "Este producto se vende bastante y el stock actual es bajo, por eso se recomienda comprar X unidades".
+- "Este producto tiene buen stock, pero es importante mantener un nivel mínimo de Y unidades", etc.
+
+No repitas la tabla ni uses listas muy largas, solo un texto corrido y claro.
+
+Tabla de datos (formato CSV):
+
+{tabla_csv}
+"""
+
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Eres un analista de inventario de un minimercado. "
+                        "Explicas las recomendaciones de compra en español, "
+                        "en lenguaje sencillo, sin términos técnicos."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+
+        summary_text = resp.choices[0].message.content or ""
+
+        # Convertimos df_top en lista de productos para el front
+        products_list = [
+            SummaryProduct(
+                product_id=str(row["product_id"]),
+                product_name=str(row.get("product_name", "")),
+                current_stock=float(row.get("current_stock", 0.0)),
+                target_stock=float(row.get("target_stock", 0.0)),
+                recommended_order=float(row.get("recommended_order", 0.0)),
+                predicted_demand_1day=float(row.get("predicted_demand_1day", 0.0)),
+            )
+            for _, row in df_top.iterrows()
+        ]
+
+    return SummaryReport(
+        ref_date=fecha,
+        lead_time_days=lead_time_days,
+        service_z=service_z,
+        products=products_list,
+        summary=summary_text,
+    )
+
+
+# ============================================================
+# ENDPOINT DE RESUMEN CSV CON OPENAI (OPCIONAL)
+# ============================================================
+
+@app.get("/reporte-resumen-csv")
+def reporte_resumen_csv(
+    fecha: str = Query(..., description="Fecha YYYY-MM-DD"),
+    lead_time_days: int = Query(5, ge=1),
+    service_z: float = Query(1.28),
+    max_items: int = Query(50, ge=1, le=200),
+):
+    """
+    Genera un resumen en lenguaje natural sobre las recomendaciones globales
+    y lo devuelve como un CSV descargable con una sola columna: summary.
+    """
+
+    if os.environ.get("OPENAI_API_KEY") is None:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY no está configurada en el servidor.",
+        )
+
+    df_orders = recommend_orders_all(
+        ref_date=fecha,
+        lead_time_days=lead_time_days,
+        service_z=service_z,
+        panel_df=panel,
+        model=model,
+        feature_cols=feature_cols,
+        lookback=LOOKBACK,
+    )
+
     if df_orders.empty:
-        texto = (
+        summary_text = (
             f"Para la fecha {fecha} no se encontraron productos con recomendación "
             "de compra. El inventario parece suficiente según el modelo."
         )
     else:
-        # Reducimos a los primeros N productos para que el prompt no sea gigante
         df_top = df_orders.head(max_items).copy()
 
         cols = [
@@ -392,18 +521,27 @@ Tabla de datos (formato CSV):
 {tabla_csv}
 """
 
-        resp = openai_client.responses.create(
-            model="gpt-4.1-mini",
-            input=prompt,
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Eres un analista de inventario de un minimercado. "
+                        "Explicas las recomendaciones de compra en español, "
+                        "en lenguaje sencillo, sin términos técnicos."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
         )
 
-        # Tomamos el texto generado
-        texto = resp.output[0].content[0].text.value
+        summary_text = resp.choices[0].message.content or ""
 
     # 2) Construimos un CSV en memoria con una sola columna 'summary'
     buffer = StringIO()
     buffer.write("summary\n")
-    safe_text = texto.replace('"', '""')
+    safe_text = summary_text.replace('"', '""')
     buffer.write(f'"{safe_text}"\n')
     buffer.seek(0)
 
@@ -438,18 +576,16 @@ async def upload_csv(file: UploadFile = File(...)):
 
         # ========= NORMALIZAR COLUMNA DATE EN EL CSV NUEVO =========
         if "date" in df_new.columns:
-            # Tus nuevos CSV vienen como "YYYY-MM-DD"
             df_new["date"] = pd.to_datetime(
                 df_new["date"],
-                format="%Y-%m-%d",   # fuerza exactamente este formato
-                errors="coerce"
+                format="%Y-%m-%d",
+                errors="coerce",
             )
 
-            # Validar que no haya fechas inválidas
             if df_new["date"].isna().any():
                 raise HTTPException(
                     status_code=400,
-                    detail="El CSV contiene fechas en formato inválido. Debe ser YYYY-MM-DD."
+                    detail="El CSV contiene fechas en formato inválido. Debe ser YYYY-MM-DD.",
                 )
 
         # --- Validar columnas mínimas ---
@@ -465,15 +601,14 @@ async def upload_csv(file: UploadFile = File(...)):
             )
 
         # ========= CARGAR PANEL EXISTENTE Y NORMALIZAR DATE =========
-        df_existing = pd.read_csv(PANEL_CSV)  # sin parse_dates aquí
+        df_existing = pd.read_csv(PANEL_CSV)
 
         if "date" in df_existing.columns:
             df_existing["date"] = pd.to_datetime(
                 df_existing["date"],
-                errors="coerce"
+                errors="coerce",
             )
 
-        # Limpiar fechas inválidas
         if df_existing["date"].isna().any():
             df_existing = df_existing.dropna(subset=["date"])
 
@@ -488,15 +623,14 @@ async def upload_csv(file: UploadFile = File(...)):
             .drop_duplicates(subset=["product_id", "date"], keep="last")
         )
 
-        # Asegurar que la date combinada sigue siendo datetime
         if "date" in df_combined.columns:
-            df_combined["date"] = pd.to_datetime(df_combined["date"], errors="coerce")
+            df_combined["date"] = pd.to_datetime(
+                df_combined["date"], errors="coerce"
+            )
 
-        # Guardar panel actualizado
         df_combined.to_csv(PANEL_CSV, index=False, encoding="utf-8-sig")
         print("Panel actualizado guardado en:", PANEL_CSV)
 
-        # Actualizar el panel global en memoria
         global panel
         panel = df_combined
 
@@ -519,7 +653,6 @@ async def upload_csv(file: UploadFile = File(...)):
 
         model.fit(X_train, y_train, epochs=3, batch_size=32, verbose=1)
 
-        # Guardar el modelo actualizado
         model.save(MODEL_PATH)
         print("Modelo reentrenado y guardado en:", MODEL_PATH)
 
@@ -530,7 +663,6 @@ async def upload_csv(file: UploadFile = File(...)):
         }
 
     except HTTPException:
-        # Re-lanzar errores de validación para que lleguen tal cual al frontend
         raise
     except Exception as e:
         print(f"Error al procesar el archivo: {e}")
@@ -538,4 +670,3 @@ async def upload_csv(file: UploadFile = File(...)):
             status_code=500,
             detail=f"Error al cargar o reentrenar el modelo: {e}",
         )
-
