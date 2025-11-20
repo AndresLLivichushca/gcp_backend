@@ -1,7 +1,12 @@
 from fastapi import FastAPI, HTTPException, Query, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from langchain_openai import ChatOpenAI
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.prompts import PromptTemplate
+
+
 from typing import List
 import pandas as pd
 import numpy as np
@@ -48,8 +53,54 @@ model.compile(
 )
 print("[INIT] Todo cargado correctamente.")
 
-# Cliente de OpenAI 
+# Cliente de OpenAI (para el endpoint CSV)
 openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+# ============================================================
+# LANGCHAIN: MODELO DE SALIDA + PARSER + LLM + PROMPT
+# ============================================================
+
+class LLMResumenInventario(BaseModel):
+    resumen_general: str = Field(
+        description="Resumen narrativo (1-3 párrafos) del estado del inventario y recomendaciones, en español sencillo."
+    )
+
+# Parser que obliga al LLM a respetar este esquema
+parser_resumen = PydanticOutputParser(pydantic_object=LLMResumenInventario)
+
+# LLM de LangChain (usa la misma OPENAI_API_KEY del entorno)
+llm_resumen = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.2,
+    openai_api_key=os.environ.get("OPENAI_API_KEY"),
+)
+
+# Prompt con instrucciones + formato estructurado
+prompt_resumen = PromptTemplate(
+    template="""
+Eres un analista de inventario de un minimercado.
+
+Tienes una tabla CSV con recomendaciones de compra de productos.
+Cada fila indica el producto, su stock actual, el stock objetivo y la cantidad recomendada de compra.
+
+Tu tarea es generar un RESUMEN EN ESPAÑOL, entendible para una persona sin conocimientos técnicos.
+No menciones palabras técnicas como "stock de seguridad", "lead time" ni fórmulas.
+Habla en términos simples, por ejemplo:
+- "Este producto se vende bastante y el stock actual es bajo, por eso se recomienda comprar X unidades".
+- "Este producto tiene buen stock, pero es importante mantener un nivel mínimo de Y unidades", etc.
+
+No repitas la tabla ni uses listas muy largas, solo un texto corrido y claro.
+
+Tabla de datos (formato CSV):
+
+{tabla}
+
+{format_instructions}
+""",
+    input_variables=["tabla"],
+    partial_variables={"format_instructions": parser_resumen.get_format_instructions()},
+)
+
 
 # ============================================================
 # FUNCIONES AUXILIARES
@@ -331,7 +382,7 @@ def get_recommendations_all(
 
 
 # ============================================================
-# ENDPOINT DE RESUMEN INTELIGENTE (JSON)
+# ENDPOINT DE RESUMEN INTELIGENTE (JSON) - USA LANGCHAIN
 # ============================================================
 
 @app.get("/reporte-resumen-json", response_model=SummaryReport)
@@ -344,10 +395,9 @@ def reporte_resumen_json(
     """
     Devuelve:
     - lista de productos urgentes (recommended_order > 0)
-    - un resumen en lenguaje natural generado por el agente
+    - un resumen en lenguaje natural generado por el LLM vía LangChain
     """
 
-    # Verificar que la API key esté configurada
     if os.environ.get("OPENAI_API_KEY") is None:
         raise HTTPException(
             status_code=500,
@@ -391,41 +441,23 @@ def reporte_resumen_json(
 
         tabla_csv = df_prompt.to_csv(index=False)
 
-        prompt = f"""
-Eres un analista de inventario de un minimercado.
+        # ======= LANGCHAIN: generar resumen estructurado =======
+        try:
+            formatted_prompt = prompt_resumen.format(tabla=tabla_csv)
 
-Tienes una tabla CSV con recomendaciones de compra de productos.
-Cada fila indica el producto, su stock actual, el stock objetivo y la cantidad recomendada de compra.
+            # Llamar al LLM (ChatOpenAI)
+            llm_msg = llm_resumen.invoke(formatted_prompt)
 
-Tu tarea es escribir un RESUMEN EN ESPAÑOL, entendible para una persona sin conocimientos técnicos.
-No menciones palabras técnicas como "stock de seguridad", "lead time" ni fórmulas.
-Habla en términos simples, por ejemplo:
-- "Este producto se vende bastante y el stock actual es bajo, por eso se recomienda comprar X unidades".
-- "Este producto tiene buen stock, pero es importante mantener un nivel mínimo de Y unidades", etc.
+            # Parsear la respuesta al modelo Pydantic
+            parsed: LLMResumenInventario = parser_resumen.parse(llm_msg.content)
 
-No repitas la tabla ni uses listas muy largas, solo un texto corrido y claro.
+            summary_text = parsed.resumen_general
 
-Tabla de datos (formato CSV):
-
-{tabla_csv}
-"""
-
-        resp = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Eres un analista de inventario de un minimercado. "
-                        "Explicas las recomendaciones de compra en español, "
-                        "en lenguaje sencillo, sin términos técnicos."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-        )
-
-        summary_text = resp.choices[0].message.content or ""
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error al generar el resumen con LangChain: {e}",
+            )
 
         # Convertimos df_top en lista de productos para el front
         products_list = [
@@ -450,7 +482,7 @@ Tabla de datos (formato CSV):
 
 
 # ============================================================
-# ENDPOINT DE RESUMEN CSV CON OPENAI (OPCIONAL)
+# ENDPOINT DE RESUMEN CSV CON OPENAI (SIGUE CON SDK DIRECTO)
 # ============================================================
 
 @app.get("/reporte-resumen-csv")
