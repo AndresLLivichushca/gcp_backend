@@ -1,24 +1,23 @@
 from fastapi import FastAPI, HTTPException, Query, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
 from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import PromptTemplate
-
 
 from typing import List
 import pandas as pd
 import numpy as np
 import json
 from pathlib import Path
-from io import StringIO
 import os
 
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 
-from openai import OpenAI
+## enlazar asistente
+from cima_assistant import chatbot_answer
 
 # Activar ejecución eager global
 tf.config.run_functions_eagerly(True)
@@ -53,9 +52,6 @@ model.compile(
 )
 print("[INIT] Todo cargado correctamente.")
 
-# Cliente de OpenAI (para el endpoint CSV)
-openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-
 # ============================================================
 # LANGCHAIN: MODELO DE SALIDA + PARSER + LLM + PROMPT
 # ============================================================
@@ -81,15 +77,26 @@ prompt_resumen = PromptTemplate(
 Eres un analista de inventario de un minimercado.
 
 Tienes una tabla CSV con recomendaciones de compra de productos.
-Cada fila indica el producto, su stock actual, el stock objetivo y la cantidad recomendada de compra.
+Cada fila indica el producto, su stock actual, el stock objetivo,
+la cantidad recomendada de compra y la demanda diaria estimada.
 
-Tu tarea es generar un RESUMEN EN ESPAÑOL, entendible para una persona sin conocimientos técnicos.
-No menciones palabras técnicas como "stock de seguridad", "lead time" ni fórmulas.
-Habla en términos simples, por ejemplo:
-- "Este producto se vende bastante y el stock actual es bajo, por eso se recomienda comprar X unidades".
-- "Este producto tiene buen stock, pero es importante mantener un nivel mínimo de Y unidades", etc.
+La salida que generes se guardará en el campo 'resumen_general'
+de un objeto JSON. El contenido de 'resumen_general' debe ser
+TEXTO EN ESPAÑOL con exactamente estas dos secciones:
 
-No repitas la tabla ni uses listas muy largas, solo un texto corrido y claro.
+Top 3 productos en riesgo:
+1. Nombre del producto y explicación breve de por qué está cerca de quedarse sin stock.
+2. ...
+3. ...
+
+Sugerencias generales:
+- 2 a 4 frases simples con recomendaciones generales para el encargado.
+
+Reglas:
+- No menciones palabras técnicas como "stock de seguridad", "lead time" ni fórmulas.
+- Usa frases cortas y muy claras.
+- Si hay menos de 3 productos, lista solo los que existan.
+- Usa un lenguaje muy sencillo y directo.
 
 Tabla de datos (formato CSV):
 
@@ -100,7 +107,6 @@ Tabla de datos (formato CSV):
     input_variables=["tabla"],
     partial_variables={"format_instructions": parser_resumen.get_format_instructions()},
 )
-
 
 # ============================================================
 # FUNCIONES AUXILIARES
@@ -302,6 +308,14 @@ class SummaryReport(BaseModel):
     service_z: float
     products: List[SummaryProduct]
     summary: str
+    
+######### chat
+class ChatRequest(BaseModel):
+    message: str
+
+
+class ChatResponse(BaseModel):
+    reply: str
 
 
 # ============================================================
@@ -395,7 +409,10 @@ def reporte_resumen_json(
     """
     Devuelve:
     - lista de productos urgentes (recommended_order > 0)
-    - un resumen en lenguaje natural generado por el LLM vía LangChain
+    - un resumen en lenguaje natural generado por el LLM vía LangChain,
+      estructurado como:
+        * Top 3 productos en riesgo
+        * Sugerencias generales
     """
 
     if os.environ.get("OPENAI_API_KEY") is None:
@@ -415,7 +432,7 @@ def reporte_resumen_json(
         lookback=LOOKBACK,
     )
 
-    # Filtramos solo los productos que realmente necesitan pedido
+    # Filtrar solo productos que realmente necesitan pedido
     df_urgent = df_orders[df_orders["recommended_order"] > 0].copy()
 
     if df_urgent.empty:
@@ -428,6 +445,7 @@ def reporte_resumen_json(
         # Limitamos a max_items para no hacer el prompt gigante
         df_top = df_urgent.head(max_items)
 
+        # Columnas que enviaremos al LLM
         cols = [
             "product_id",
             "product_name",
@@ -445,7 +463,7 @@ def reporte_resumen_json(
         try:
             formatted_prompt = prompt_resumen.format(tabla=tabla_csv)
 
-            # Llamar al LLM (ChatOpenAI)
+            # Llamar al LLM (ChatOpenAI de LangChain)
             llm_msg = llm_resumen.invoke(formatted_prompt)
 
             # Parsear la respuesta al modelo Pydantic
@@ -472,6 +490,7 @@ def reporte_resumen_json(
             for _, row in df_top.iterrows()
         ]
 
+    # Devolvemos JSON (SummaryReport) para que el front haga response.json()
     return SummaryReport(
         ref_date=fecha,
         lead_time_days=lead_time_days,
@@ -480,110 +499,23 @@ def reporte_resumen_json(
         summary=summary_text,
     )
 
-
-# ============================================================
-# ENDPOINT DE RESUMEN CSV CON OPENAI (SIGUE CON SDK DIRECTO)
-# ============================================================
-
-@app.get("/reporte-resumen-csv")
-def reporte_resumen_csv(
-    fecha: str = Query(..., description="Fecha YYYY-MM-DD"),
-    lead_time_days: int = Query(5, ge=1),
-    service_z: float = Query(1.28),
-    max_items: int = Query(50, ge=1, le=200),
-):
+#-----------------------------------chat
+@app.post("/chat", response_model=ChatResponse)
+def chat_endpoint(payload: ChatRequest):
     """
-    Genera un resumen en lenguaje natural sobre las recomendaciones globales
-    y lo devuelve como un CSV descargable con una sola columna: summary.
+    Endpoint de chat general.
+    Recibe un mensaje del usuario y devuelve la respuesta del asistente CIMA Market.
     """
-
-    if os.environ.get("OPENAI_API_KEY") is None:
+    try:
+        reply_text = chatbot_answer(payload.message)
+        return ChatResponse(reply=reply_text)
+    except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail="OPENAI_API_KEY no está configurada en el servidor.",
+            detail=f"Error al procesar el chat: {e}",
         )
 
-    df_orders = recommend_orders_all(
-        ref_date=fecha,
-        lead_time_days=lead_time_days,
-        service_z=service_z,
-        panel_df=panel,
-        model=model,
-        feature_cols=feature_cols,
-        lookback=LOOKBACK,
-    )
 
-    if df_orders.empty:
-        summary_text = (
-            f"Para la fecha {fecha} no se encontraron productos con recomendación "
-            "de compra. El inventario parece suficiente según el modelo."
-        )
-    else:
-        df_top = df_orders.head(max_items).copy()
-
-        cols = [
-            "product_id",
-            "product_name",
-            "current_stock",
-            "target_stock",
-            "recommended_order",
-            "predicted_demand_1day",
-        ]
-        cols = [c for c in cols if c in df_top.columns]
-        df_prompt = df_top[cols]
-
-        tabla_csv = df_prompt.to_csv(index=False)
-
-        prompt = f"""
-Eres un analista de inventario de un minimercado.
-
-Tienes una tabla CSV con recomendaciones de compra de productos.
-Cada fila indica el producto, su stock actual, el stock objetivo y la cantidad recomendada de compra.
-
-Tu tarea es escribir un RESUMEN EN ESPAÑOL, entendible para una persona sin conocimientos técnicos.
-No menciones palabras técnicas como "stock de seguridad", "lead time" ni fórmulas.
-Habla en términos simples, por ejemplo:
-- "Este producto se vende bastante y el stock actual es bajo, por eso se recomienda comprar X unidades".
-- "Este producto tiene buen stock, pero es importante mantener un nivel mínimo de Y unidades", etc.
-
-No repitas la tabla ni uses listas muy largas, solo un texto corrido y claro.
-
-Tabla de datos (formato CSV):
-
-{tabla_csv}
-"""
-
-        resp = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Eres un analista de inventario de un minimercado. "
-                        "Explicas las recomendaciones de compra en español, "
-                        "en lenguaje sencillo, sin términos técnicos."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-        )
-
-        summary_text = resp.choices[0].message.content or ""
-
-    # 2) Construimos un CSV en memoria con una sola columna 'summary'
-    buffer = StringIO()
-    buffer.write("summary\n")
-    safe_text = summary_text.replace('"', '""')
-    buffer.write(f'"{safe_text}"\n')
-    buffer.seek(0)
-
-    filename = f"reporte_resumen_{fecha}.csv"
-
-    return StreamingResponse(
-        buffer,
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
 
 
 # ============================================================
