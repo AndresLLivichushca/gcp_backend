@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Query, File, UploadFile
+from fastapi import FastAPI, HTTPException, Query, File, UploadFile, Form
+
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -498,24 +499,48 @@ def reporte_resumen_json(
         products=products_list,
         summary=summary_text,
     )
-
+# end point del chatbot
 #-----------------------------------chat
 @app.post("/chat", response_model=ChatResponse)
-def chat_endpoint(payload: ChatRequest):
+async def chat_endpoint(
+    message: str = Form(...),
+    file: UploadFile | None = File(None),
+):
     """
     Endpoint de chat general.
-    Recibe un mensaje del usuario y devuelve la respuesta del asistente CIMA Market.
+
+    - Si solo llega 'message' => conversación normal con el asistente CIMA Market.
+    - Si además llega 'file' (CSV) => se llama a upload_csv para reentrenar el modelo
+      y se devuelve un mensaje de confirmación al usuario.
     """
     try:
-        reply_text = chatbot_answer(payload.message)
+        # --- CASO 1: viene CSV adjunto ---
+        if file is not None:
+            # Reutilizamos la lógica de /upload-csv
+            result = await upload_csv(file)
+
+            fname = result.get("filename", file.filename)
+            msg = result.get("message", "CSV procesado correctamente.")
+
+            return ChatResponse(
+                reply=(
+                    f"He recibido el archivo {fname}. "
+                    f"{msg} Ahora las recomendaciones de stock se actualizarán con estos datos."
+                )
+            )
+
+        # --- CASO 2: solo texto => chat normal ---
+        reply_text = chatbot_answer(message)
         return ChatResponse(reply=reply_text)
+
+    except HTTPException:
+        # Si upload_csv ya lanzó un HTTPException, la dejamos pasar
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Error al procesar el chat: {e}",
         )
-
-
 
 
 # ============================================================

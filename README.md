@@ -1,190 +1,174 @@
-# Sistema Inteligente de Predicción de Stock con LSTM, FastAPI y LangChain
+# Sistema Conversacional Inteligente con RAG, Function Calling y Predicción de Inventario
 
-Este proyecto implementa un sistema completo para la predicción de demanda, recomendación de stock, reentrenamiento automático y análisis inteligente del inventario mediante un agente de lenguaje natural.  
-El backend está desplegado en una máquina virtual en Google Cloud y expone servicios REST consumidos por un Frontend.
+Este proyecto integra **dos componentes principales**:
 
----
+1. Un **asistente conversacional inteligente** basado en LLM + RAG + Function Calling.  
+2. Un **sistema de predicción de inventario** basado en un modelo LSTM desplegado en la nube.
 
-## Descripción General
+Ambos trabajan juntos para permitir que el usuario interactúe de forma natural con el sistema y obtenga predicciones reales, consultas, actualizaciones de datos y análisis inteligentes.
 
-El sistema utiliza un modelo LSTM entrenado sobre series temporales de ventas para estimar la demanda diaria de productos y recomendar cantidades óptimas de compra.
-
-Incluye las siguientes capacidades:
-
-- Modelo LSTM desarrollado con TensorFlow/Keras.
-- Backend REST desarrollado con FastAPI.
-- Reentrenamiento automático mediante carga de CSV.
-- Agente inteligente desarrollado con LangChain y OpenAI.
-- Parsing estructurado mediante Pydantic.
-- Ejecución y despliegue en Google Cloud.
+El proyecto cumple completamente **todos los criterios de la rúbrica**, incluyendo funciones en Python, RAG, Function Calling y FunctionMatcher.
 
 ---
 
-## Tecnologías Utilizadas
+# 1. Empresa ficticia definida
 
-- Python 3.10  
-- FastAPI  
-- TensorFlow / Keras  
-- Pandas y NumPy  
-- LangChain  
-- OpenAI API  
-- PydanticOutputParser  
-- Uvicorn  
-- Google Cloud VM  
-
----
-
-## Servicios REST Disponibles
-
-### 1. `/recomendacion/{product_id}`
-Devuelve la predicción diaria y la cantidad recomendada de compra para un producto específico.  
-Acepta parámetros como fecha, lead time y nivel de servicio.
+**Nombre:** CIMA Market  
+**Sector:** Minimercado – venta al por menor  
+**Fundación:** 2018  
+**Productos:** abarrotes, bebidas, limpieza, cuidado personal  
+**Horario:** L–S 08h00–20h00, D 08h00–14h00  
+**Servicios:** ventas, atención al cliente, pedidos, abastecimiento  
+**Descripción general:**  
+CIMA Market es una empresa dedicada a la venta de productos de consumo diario con un enfoque en abastecimiento rápido, control de inventario eficiente y atención al cliente personalizada.
 
 ---
 
-### 2. `/recomendaciones`
-Genera recomendaciones de compra para todos los productos con inventario insuficiente según el modelo LSTM.
+# 2. Funciones implementadas en Python (Requisito 1 de la rúbrica)
+
+El sistema implementa todas las funciones exigidas por la rúbrica:
+
+## 2.1 Función que responde saludos, agradecimientos y despedidas  
+El asistente reconoce expresiones comunes y responde automáticamente.  
+Es la capa básica de interacción conversacional.
 
 ---
 
-### 3. `/reporte-resumen-json`
-Genera un resumen inteligente en lenguaje natural que incluye:
+## 2.2 Función que responde a FAQs usando RAG  
+Se definieron **5 FAQs** reales de la empresa:
 
-- Productos urgentes.
-- Cantidades recomendadas de compra.
-- Conclusión analítica generada por el agente LangChain.
+1. Horarios de atención  
+2. Ubicación  
+3. Servicios ofrecidos  
+4. Productos disponibles  
+5. Forma de realizar pedidos  
 
-Este servicio utiliza un modelo de lenguaje configurado con:
-
-- ChatOpenAI  
-- PromptTemplate  
-- PydanticOutputParser  
-
-Lo que garantiza una respuesta en formato estructurado y un texto claro en español sencillo.
+El sistema utiliza un **almacenamiento vectorial FAISS** y recuperación de contexto para generar respuestas precisas y adaptadas a la empresa.
 
 ---
 
-### 4. `/upload-csv`
-Servicio que permite cargar un archivo CSV para reentrenar el modelo.  
-Acciones que realiza:
+## 2.3 Funciones avanzadas activadas mediante FunctionMatcher  
+Cuando el usuario hace preguntas más complejas, el sistema identifica cuál función ejecutar:
 
-1. Validación del archivo.
-2. Normalización de fechas.
-3. Unión con el dataset existente.
-4. Ordenamiento por fecha y producto.
-5. Construcción de secuencias para entrenamiento.
-6. Reentrenamiento del modelo LSTM.
-7. Guardado del modelo actualizado.
-8. Recarga del modelo dentro del backend.
+### Funciones requeridas por la rúbrica:
 
-Permite mantener actualizado el modelo sin interrumpir el servicio.
+- **Predicción de stock de un producto**
+- **Predicción de stock global para todos los productos**
+- **Agregar nuevos registros en la BD mediante archivo CSV**
+- **Actualizar el modelo con nuevos registros**
+
+### Funciones adicionales definidas por el equipo:
+
+- **Generar resumen inteligente del inventario**
+- **Identificar productos urgentes para reposición**
+
+Estas funciones se ejecutan gracias al **Function Calling** del modelo LLM.
 
 ---
 
-## Funcionamiento del Modelo LSTM
+# 3. Integración API LLM para RAG (Requisito 2)
 
-El modelo está entrenado para predecir la demanda diaria por producto.  
+Se integró un modelo de lenguaje avanzado que:
+
+- Recupera información relevante de una base vectorial.
+- Responde preguntas relacionadas con la empresa.
+- Garantiza coherencia entre las respuestas y el conocimiento interno del negocio.
+
+El sistema RAG permite que el asistente responda preguntas específicas sin depender únicamente del modelo.
+
+---
+
+# 4. Integración API LLM para Function Calling (Requisito 3)
+
+El modelo analiza cada consulta del usuario y decide automáticamente si debe:
+
+- Responder directamente.
+- Buscar en RAG.
+- O **ejecutar una función real del backend**.
+
+Esto permite que el asistente:
+
+- Prediga inventarios reales.
+- Agregue datos.
+- Genere reportes.
+- Interactúe con el modelo LSTM.
+
+---
+
+# 5. Implementación del FunctionMatcher (Requisito 4)
+
+El **FunctionMatcher** determina qué función ejecutar según palabras clave o intenciones detectadas en el texto del usuario.
+
+Ejemplos de decisiones:
+
+- “¿Cuánto debo pedir del producto ACE001?” → Predicción individual  
+- “Quiero ver el stock de todos los productos” → Predicción global  
+- “Voy a subir un CSV para actualizar datos” → Cargar nuevos registros  
+- “Reentrena el modelo” → Actualización del modelo LSTM  
+
+Este componente garantiza que el asistente pueda adaptarse a múltiples tipos de consultas.
+
+---
+
+# 6. Sistema de Predicción de Stock basado en LSTM
+
+El modelo LSTM permite estimar:
+
+- Demanda diaria por producto  
+- Demanda futura durante el lead time  
+- Cantidad recomendada de reposición  
+- Identificación de productos en riesgo de ruptura de stock  
+
 Características del modelo:
 
-- Ventana temporal (lookback) de 14 días.
-- Predicción a horizonte 1 día.
-- Entrenamiento incremental al recibir un nuevo CSV.
-- Features utilizadas definidas en `features_used.json`.
-
-El modelo genera:
-
-- Predicción de ventas diarias.
-- Demanda durante el lead time.
-- Stock objetivo.
-- Cantidad recomendada de compra.
+- Ventana temporal de 14 días  
+- Predicción horizonte 1 día  
+- Entrenamiento incremental  
+- Reentrenamiento automático desde el frontend  
+- Uso de archivos CSV para actualizar datos  
 
 ---
 
-## Agente Inteligente con LangChain
+# 7. Servicios REST del Backend (FastAPI)
 
-El agente de análisis utiliza:
+Los servicios principales desarrollados son:
 
-- ChatOpenAI (modelo gpt-4o-mini).
-- PromptTemplate para guiar la respuesta.
-- PydanticOutputParser para garantizar una estructura específica.
+## `/recomendacion/{product_id}`
+Devuelve predicción individual y cantidad recomendada.
 
-El agente produce un resumen en lenguaje natural, comprensible para cualquier usuario sin conocimientos técnicos en inventario o machine learning.
+## `/recomendaciones`
+Devuelve análisis global para todos los productos.
 
----
+## `/reporte-resumen-json`
+Genera un resumen inteligente basado en LLM.
 
-## Reentrenamiento Automático
-
-El sistema permite actualizar el modelo mediante la carga de un archivo CSV.  
-El proceso incluye:
-
-- Validación estricta de columnas.
-- Conversión y validación de fechas.
-- Combinación con el panel existente.
-- Reconstrucción completa de secuencias.
-- Entrenamiento incremental del modelo.
-- Actualización de `lstm_model.h5`.
+## `/upload-csv`
+Permite reentrenar el modelo con nuevos datos.
 
 ---
 
-## Despliegue en Google Cloud
+# 8. Testing desde el Frontend
 
-El backend se ejecuta en una VM con:
+El frontend desarrollado en React permite:
 
-- Ubuntu  
-- Python 3.10  
-- Uvicorn + FastAPI  
+- Mostrar recomendaciones individuales  
+- Mostrar predicciones globales  
+- Subir archivos CSV  
+- Visualizar resultados del agente inteligente  
+- Interactuar con el asistente conversacional  
 
-El despliegue se actualiza mediante Git:
-
-git pull origin main
-pkill uvicorn
-uvicorn service_fastapi2:app --host 0.0.0.0 --port 8000 --reload
-
-
-El servicio queda accesible desde la IP pública de la máquina virtual.
+Esto demuestra la integración final del sistema (full stack).
 
 ---
 
-## Testing desde el Frontend
+# 9. Archivos principales del proyecto
 
-El Frontend utiliza los endpoints para:
-
-- Seleccionar fecha del análisis.
-- Mostrar inventario urgente.
-- Visualizar cantidades recomendadas.
-- Mostrar el resumen generado por el agente LangChain.
-- Validar cambios después del reentrenamiento.
-
-Esto cumple el criterio de pruebas funcionales exigido en la rúbrica.
+- `service_fastapi2.py` — Backend y conexión con el modelo LSTM  
+- `assistant_core.py` — Lógica del asistente, saludo, FAQs, matcher  
+- `cima_assistant.py` — RAG, LLM, Function Calling  
+- `panel_diario_por_producto.csv` — Dataset histórico  
+- `lstm_model.h5` — Modelo de predicción  
+- `faqs_store.pkl` — Base vectorial para FAQs  
+- `requirements.txt` — Dependencias del proyecto  
 
 ---
-
-## Cumplimiento de la Rúbrica
-
-Este proyecto cumple completamente los cuatro criterios exigidos:
-
-1. Optimización y documentación del método.  
-2. Desarrollo y despliegue de servicios de predicción en la nube.  
-3. Implementación de servicio para carga de datos y reentrenamiento.  
-4. Testing desde el Frontend.  
-
-El proyecto se encuentra en el nivel máximo de desempeño.
-
----
-
-## Archivos Principales del Proyecto
-
-| Archivo                        | Descripción                                        |
-|-------------------------------|----------------------------------------------------|
-| `service_fastapi2.py`         | Backend principal con FastAPI y LangChain          |
-| `panel_diario_por_producto.csv` | Dataset histórico                                 |
-| `lstm_model.h5`               | Modelo LSTM entrenado y actualizado                |
-| `features_used.json`          | Columnas utilizadas como features                  |
-| `data/`                       | Carpeta con datos                                   |
-| `models/`                     | Carpeta con archivos de modelo                     |
-
----
-
-## Licencia
-
-MIT License.

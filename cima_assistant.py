@@ -1,21 +1,23 @@
 # ============================================
 # 1. IMPORTS Y CONFIGURACIÓN
 # ============================================
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
 import os
 import re
 import json
 from typing import List, Dict, Any, Optional
 
 import requests
-from openai import OpenAI
-
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
-
-# Cliente OpenAI (usa la variable de entorno OPENAI_API_KEY)
-openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # URL del backend FastAPI de stock
 BACKEND_URL = "http://127.0.0.1:8000"   # cambia si usas otra IP
@@ -59,7 +61,7 @@ def get_company_info() -> str:
 # ============================================
 
 SALUDOS_REGEX = re.compile(
-    r"\b(hola|buenos dias|buen día|buenas tardes|buenas noches|que tal|qué tal)\b",
+    r"\b(hola|buenos dias|buen día|buen dia|buenas tardes|buenas noches|que tal|qué tal)\b",
     re.IGNORECASE,
 )
 AGRADECIMIENTOS_REGEX = re.compile(
@@ -149,18 +151,40 @@ faq_prompt = PromptTemplate(
 
 
 def answer_faq(question: str) -> str:
-    """Responde FAQs usando RAG."""
+    """Responde FAQs usando RAG y deja logs de qué FAQ se usó."""
     docs = faq_retriever.invoke(question)
     context_text = "\n\n".join(d.page_content for d in docs)
+
+    logging.info("[RAG][FAQ] Pregunta usuario: %s", question)
+
+    for idx, d in enumerate(docs, start=1):
+        first_line = d.page_content.split("\n")[0]
+        if first_line.lower().startswith("pregunta:"):
+            faq_q = first_line.split(":", 1)[1].strip()
+        else:
+            faq_q = first_line.strip()
+
+        logging.info("[RAG][FAQ] Top %d -> %s", idx, faq_q)
+
+    if docs:
+        first_line = docs[0].page_content.split("\n")[0]
+        if first_line.lower().startswith("pregunta:"):
+            faq_match = first_line.split(":", 1)[1].strip()
+        else:
+            faq_match = first_line.strip()
+        logging.info("[RAG][FAQ_MATCH] FAQ seleccionada (Top 1): %s", faq_match)
+
     prompt_text = faq_prompt.format(context=context_text, question=question)
     res = llm_rag.invoke(prompt_text)
     return res.content.strip()
+
 
 # ============================================
 # 5. FUNCIONES DE NEGOCIO (stock, CSV)
 # ============================================
 
 def predict_stock_one(product_code: str, date: str) -> Dict[str, Any]:
+    """Llama al backend para la recomendación de UN producto."""
     params = {
         "fecha": date,
         "lead_time_days": 5,
@@ -173,6 +197,7 @@ def predict_stock_one(product_code: str, date: str) -> Dict[str, Any]:
 
 
 def predict_stock_all(date: str) -> List[Dict[str, Any]]:
+    """Llama al backend para la recomendación de TODOS los productos."""
     params = {
         "fecha": date,
         "lead_time_days": 5,
@@ -194,14 +219,11 @@ def add_new_products_csv(csv_path: str) -> Dict[str, Any]:
     return resp.json()
 
 # ============================================================
-# 5.1 NUEVA FUNCIÓN 1: INVENTARIO POR CATEGORÍAS
+# 5.1 INVENTARIO POR CATEGORÍAS
 # ============================================================
 
 def infer_category(item: Dict[str, Any]) -> str:
-    """
-    Intenta inferir la categoría del producto a partir del product_id o el nombre.
-    Ajusta las reglas según tus códigos reales (GRA, LAC, BEB, LIM, etc.).
-    """
+    """Inferir categoría aproximada a partir de ID o nombre."""
     pid = str(item.get("product_id", "")).upper()
     name = str(item.get("product_name", "")).lower()
 
@@ -220,9 +242,8 @@ def infer_category(item: Dict[str, Any]) -> str:
 
 def inventory_value_by_category(date: str) -> str:
     """
-    Nueva función 1:
-    Calcula el 'valor' del inventario por categoría para una fecha dada,
-    usando la cantidad de unidades (current_stock) como medida.
+    Calcula 'inventario por categorías' para una fecha,
+    usando current_stock como medida.
     """
     items = predict_stock_all(date)
     if not items:
@@ -254,13 +275,12 @@ def inventory_value_by_category(date: str) -> str:
     return "\n".join(lines)
 
 # ============================================================
-# 5.2 NUEVA FUNCIÓN 2: TOP 3 PRODUCTOS MÁS VENDIDOS
+# 5.2 TOP 3 PRODUCTOS MÁS VENDIDOS
 # ============================================================
 
 def top3_best_sellers(date: str) -> str:
     """
-    Nueva función 2:
-    Muestra el top 3 de productos con mayor demanda diaria estimada
+    Top 3 de productos con mayor demanda diaria estimada
     (predicted_demand_1day) para una fecha dada.
     """
     items = predict_stock_all(date)
@@ -303,146 +323,139 @@ def top3_best_sellers(date: str) -> str:
 
 def function_matcher(user_query: str) -> str:
     """
-    Devuelve el nombre lógico de la función que se debería usar.
-    Posibles retornos:
-      - 'SALUDO'
-      - 'FAQ'
-      - 'PREDICCION_UN_PRODUCTO'
-      - 'PREDICCION_TODOS'
-      - 'AGREGAR_REGISTROS'
-      - 'INVENTARIO'
-      - 'MAX_VENDIDOS'
-      - 'DESCONOCIDO'
+    STRICT MODE: detecta funciones en este orden de prioridad:
+    1) Saludos
+    2) Predicción TODOS los productos
+    3) Predicción de UN producto
+    4) Top 3 más vendidos
+    5) Inventario por categorías
+    6) Agregar registros (CSV)
+    7) FAQs
+    8) Desconocido
     """
     text = user_query.lower()
 
-    # saludos / despedidas
+    # 1) SALUDOS / AGRADECIMIENTOS / DESPEDIDAS
     if handle_greetings(text) is not None:
-        return "SALUDO"
+        fn = "SALUDO"
+        logging.info("[FUNCTION_MATCHER] Query='%s' => %s", user_query, fn)
+        return fn
 
-    # primero: todos los productos (para que no se confunda con uno solo)
+    # 2) PREDICCIÓN DE STOCK DE TODOS LOS PRODUCTOS
     if "stock de todos" in text or "todos los productos" in text:
-        return "PREDICCION_TODOS"
+        fn = "PREDICCION_TODOS"
+        logging.info("[FUNCTION_MATCHER] Query='%s' => %s", user_query, fn)
+        return fn
 
-    # FAQs típicas
-    if any(pal in text for pal in ["horario", "dirección", "direccion", "ubicado", "domicilio", "tarjeta"]):
-        return "FAQ"
-
-    # stock de un producto
+    # 3) PREDICCIÓN DE STOCK DE UN PRODUCTO
     if "stock" in text and ("producto" in text or "código" in text or "codigo" in text):
-        return "PREDICCION_UN_PRODUCTO"
+        fn = "PREDICCION_UN_PRODUCTO"
+        logging.info("[FUNCTION_MATCHER] Query='%s' => %s", user_query, fn)
+        return fn
 
-    # agregar / registrar productos
-    if any(p in text for p in ["agregar productos", "nuevos registros", "subir csv"]):
-        return "AGREGAR_REGISTROS"
+    # 4) TOP 3 PRODUCTOS MÁS VENDIDOS
+    if any(p in text for p in [
+        "top 3", "top3",
+        "tres más vendidos", "tres mas vendidos",
+        "productos más vendidos", "productos mas vendidos"
+    ]):
+        fn = "MAX_VENDIDOS"
+        logging.info("[FUNCTION_MATCHER] Query='%s' => %s", user_query, fn)
+        return fn
 
-    # NUEVA FUNCIÓN 1: inventario valorizado por categorías
-    if any(p in text for p in ["inventario valorizado", "valor del inventario", "por categorías", "por categorias"]):
-        return "INVENTARIO"
+    # 5) INVENTARIO VALORIZADO / POR CATEGORÍAS
+    if any(p in text for p in [
+        "inventario valorizado",
+        "valor del inventario",
+        "inventario por categorías",
+        "inventario por categorias"
+    ]):
+        fn = "INVENTARIO"
+        logging.info("[FUNCTION_MATCHER] Query='%s' => %s", user_query, fn)
+        return fn
 
-    # NUEVA FUNCIÓN 2: top 3 más vendidos
-    if any(p in text for p in ["top 3", "top3", "más vendidos", "mas vendidos", "productos más vendidos"]):
-        return "MAX_VENDIDOS"
+    # 6) AGREGAR REGISTROS DESDE CSV
+    if any(p in text for p in [
+        "agregar productos",
+        "nuevos registros",
+        "subir csv",
+        "cargar csv"
+    ]):
+        fn = "AGREGAR_REGISTROS"
+        logging.info("[FUNCTION_MATCHER] Query='%s' => %s", user_query, fn)
+        return fn
 
-    return "DESCONOCIDO"
-
-# ============================================
-# 7. ORQUESTADOR PRINCIPAL
-# ============================================
-
-def chatbot_answer(user_query: str) -> str:
-    """
-    Orquesta toda la lógica:
-    1. Si la pregunta contiene palabras típicas de FAQ (horario, dirección, etc.),
-       responde usando RAG (answer_faq), aunque tenga un saludo.
-    2. Si el mensaje es un saludo/agradecimiento/despedida CORTO, responde smalltalk.
-    3. Si no, usa function_matcher para decidir la función de negocio o una respuesta genérica.
-    """
-    lower = user_query.lower()
-
-    # 1) Si parece FAQ, vamos directo al RAG
+    # 7) FAQ / RAG
     faq_keywords = [
         "horario", "hora de atención", "hora de atencion",
         "dirección", "direccion",
         "ubicado", "ubicación", "ubicacion",
         "domicilio", "servicio a domicilio",
-        "tarjeta", "pago", "pagar con"
+        "tarjeta", "pago", "pagar",
+        "productos", "producto", "ofrecen", "venden"
     ]
-    if any(k in lower for k in faq_keywords):
-        return answer_faq(user_query)
+    if any(k in text for k in faq_keywords):
+        fn = "FAQ"
+        logging.info("[FUNCTION_MATCHER] Query='%s' => %s", user_query, fn)
+        return fn
 
-    # 2) Smalltalk SOLO si es un mensaje corto (tipo "hola", "buenas", etc.)
-    greeting_resp = handle_greetings(user_query)
-    if greeting_resp is not None and len(lower.split()) <= 4:
-        return greeting_resp
+    # 8) DESCONOCIDO
+    fn = "DESCONOCIDO"
+    logging.info("[FUNCTION_MATCHER] Query='%s' => %s", user_query, fn)
+    return fn
 
-    # 3) Decidir función
+# ============================================
+# 7. ORQUESTADOR PRINCIPAL
+# ============================================
+
+def _extract_date_from_text(text: str) -> Optional[str]:
+    """Busca fecha tipo YYYY-MM-DD en el texto."""
+    m = re.search(r"(20\d{2}-\d{2}-\d{2})", text)
+    return m.group(1) if m else None
+
+
+def _extract_product_code(text: str) -> Optional[str]:
+    """
+    Busca algo tipo 'producto ACE001' o 'código ACE001'.
+    Ajustado a tu forma de preguntar en la rúbrica.
+    """
+    m = re.search(
+        r"(?:producto|c[oó]digo)\s+([A-Za-z0-9_-]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).upper()
+    return None
+
+
+def chatbot_answer(user_query: str) -> str:
+    """
+    Orquesta toda la lógica apoyándose SIEMPRE en function_matcher
+    para decidir qué hacer.
+    """
     fn_type = function_matcher(user_query)
 
+    # ---------- SALUDOS / DESPEDIDAS ----------
     if fn_type == "SALUDO":
-        # Por si llega aquí, devolvemos smalltalk básico
         sm = handle_greetings(user_query)
         return sm or "¡Hola! Soy el asistente de CIMA Market."
 
+    # ---------- FAQ CON RAG ----------
     if fn_type == "FAQ":
         return answer_faq(user_query)
 
     # ---------- PREDICCIÓN UN PRODUCTO ----------
     if fn_type == "PREDICCION_UN_PRODUCTO":
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "set_prediction_params",
-                    "description": (
-                        "Extrae el código de producto y la fecha de la pregunta "
-                        "del usuario para hacer una predicción de stock."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "product_code": {
-                                "type": "string",
-                                "description": "Código del producto, por ejemplo ACE001",
-                            },
-                            "date": {
-                                "type": "string",
-                                "description": "Fecha en formato YYYY-MM-DD",
-                            },
-                        },
-                        "required": ["product_code", "date"],
-                    },
-                },
-            }
-        ]
+        date = _extract_date_from_text(user_query)
+        product_code = _extract_product_code(user_query)
 
-        first = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Eres un asistente que ayuda a extraer parámetros para "
-                        "predecir el stock de un producto en un minimercado."
-                    ),
-                },
-                {"role": "user", "content": user_query},
-            ],
-            tools=tools,
-            tool_choice="auto",
-        )
-
-        tool_calls = first.choices[0].message.tool_calls
-        if not tool_calls:
-            return "No pude identificar el código de producto o la fecha. Por favor, indícalos claramente."
-
-        args = json.loads(tool_calls[0].function.arguments)
-
-        product_code = args.get("product_code")
-        date = args.get("date")
-
-        if not product_code or not date:
-            return "Me faltan datos (código de producto o fecha) para hacer la predicción."
+        if not date or not product_code:
+            return (
+                "Para ayudarte con la predicción necesito que indiques claramente "
+                "la fecha (YYYY-MM-DD) y el código del producto. Ejemplo: "
+                "«Quiero saber el stock del producto ACE001 para el 2025-03-14»."
+            )
 
         try:
             resp = predict_stock_one(product_code, date)
@@ -460,46 +473,12 @@ def chatbot_answer(user_query: str) -> str:
 
     # ---------- PREDICCIÓN TODOS LOS PRODUCTOS ----------
     if fn_type == "PREDICCION_TODOS":
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "set_date_param",
-                    "description": "Extrae la fecha en formato YYYY-MM-DD de la pregunta.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "date": {
-                                "type": "string",
-                                "description": "Fecha en formato YYYY-MM-DD",
-                            }
-                        },
-                        "required": ["date"],
-                    },
-                },
-            }
-        ]
-
-        first = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Extrae la fecha de la pregunta del usuario.",
-                },
-                {"role": "user", "content": user_query},
-            ],
-            tools=tools,
-            tool_choice="auto",
-        )
-        tool_calls = first.choices[0].message.tool_calls
-        if not tool_calls:
-            return "No pude identificar la fecha para la predicción global."
-
-        args = json.loads(tool_calls[0].function.arguments)
-        date = args.get("date")
+        date = _extract_date_from_text(user_query)
         if not date:
-            return "No pude extraer una fecha válida."
+            return (
+                "Necesito que especifiques la fecha en formato YYYY-MM-DD. "
+                "Ejemplo: «Muéstrame el stock de todos los productos para el 2025-03-14»."
+            )
 
         try:
             items = predict_stock_all(date)
@@ -521,54 +500,20 @@ def chatbot_answer(user_query: str) -> str:
     # ---------- AGREGAR REGISTROS ----------
     if fn_type == "AGREGAR_REGISTROS":
         return (
-            "Para agregar nuevos registros de productos, sube un archivo CSV al sistema. "
-            "Si estás en el cuaderno de Jupyter, puedes usar la función "
-            "`add_new_products_csv('ruta/al/archivo.csv')` para enviarlo a la API."
+            "Para agregar nuevos registros de productos, sube un archivo CSV en la sección "
+            "«Cargar nuevos registros (CSV)» de la aplicación. También puedes adjuntar el CSV "
+            "en este chat y escribir algo como «Actualiza el modelo con los nuevos registros» "
+            "para que el sistema lo cargue y reentrene el modelo."
         )
 
     # ---------- INVENTARIO POR CATEGORÍAS ----------
     if fn_type == "INVENTARIO":
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "set_date_param",
-                    "description": "Extrae la fecha en formato YYYY-MM-DD de la pregunta.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "date": {
-                                "type": "string",
-                                "description": "Fecha en formato YYYY-MM-DD",
-                            }
-                        },
-                        "required": ["date"],
-                    },
-                },
-            }
-        ]
-
-        first = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Extrae la fecha de la pregunta del usuario.",
-                },
-                {"role": "user", "content": user_query},
-            ],
-            tools=tools,
-            tool_choice="auto",
-        )
-        tool_calls = first.choices[0].message.tool_calls
-        if not tool_calls:
-            return "No pude identificar la fecha para calcular el inventario por categorías."
-
-        args = json.loads(tool_calls[0].function.arguments)
-        date = args.get("date")
+        date = _extract_date_from_text(user_query)
         if not date:
-            return "No pude extraer una fecha válida."
-
+            return (
+                "Necesito la fecha en formato YYYY-MM-DD para calcular el inventario por categorías. "
+                "Ejemplo: «Muéstrame el inventario valorizado por categorías para el 2025-03-14»."
+            )
         try:
             return inventory_value_by_category(date)
         except Exception as e:
@@ -576,46 +521,12 @@ def chatbot_answer(user_query: str) -> str:
 
     # ---------- TOP 3 MÁS VENDIDOS ----------
     if fn_type == "MAX_VENDIDOS":
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "set_date_param",
-                    "description": "Extrae la fecha en formato YYYY-MM-DD de la pregunta.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "date": {
-                                "type": "string",
-                                "description": "Fecha en formato YYYY-MM-DD",
-                            }
-                        },
-                        "required": ["date"],
-                    },
-                },
-            }
-        ]
-
-        first = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Extrae la fecha de la pregunta del usuario.",
-                },
-                {"role": "user", "content": user_query},
-            ],
-            tools=tools,
-            tool_choice="auto",
-        )
-        tool_calls = first.choices[0].message.tool_calls
-        if not tool_calls:
-            return "No pude identificar la fecha para el top 3 de productos más vendidos."
-
-        args = json.loads(tool_calls[0].function.arguments)
-        date = args.get("date")
+        date = _extract_date_from_text(user_query)
         if not date:
-            return "No pude extraer una fecha válida."
+            return (
+                "Necesito la fecha en formato YYYY-MM-DD para el top 3 de productos más vendidos. "
+                "Ejemplo: «Dame el top 3 de productos más vendidos para el 2025-03-14»."
+            )
 
         try:
             return top3_best_sellers(date)
@@ -623,17 +534,13 @@ def chatbot_answer(user_query: str) -> str:
             return f"Ocurrió un error al generar el top 3 de productos más vendidos: {e}"
 
     # ---------- RESPUESTA GENÉRICA ----------
-    generic = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Eres el asistente virtual de un minimercado llamado CIMA Market. "
-                    "Responde en español de forma amable y breve."
-                ),
-            },
-            {"role": "user", "content": user_query},
-        ],
+    logging.info("[CHATBOT] Query desconocida, usando respuesta genérica fija")
+    return (
+        "Soy el asistente virtual de CIMA Market. "
+        "Por ahora solo puedo ayudarte con:\n"
+        "- Horario y ubicación del minimercado\n"
+        "- Servicio a domicilio y formas de pago\n"
+        "- Consultas de stock y predicciones de inventario\n"
+        "- Resúmenes de inventario por categorías y top de más vendidos\n\n"
+        "Por favor reformula tu pregunta usando alguno de estos temas."
     )
-    return generic.choices[0].message.content.strip()
